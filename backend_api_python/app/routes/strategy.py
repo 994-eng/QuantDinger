@@ -23,6 +23,11 @@ from app.services.ai_code_edits import (
     CodeEditError,
     apply_model_code_edits,
 )
+from app.services.llm_length_recovery import (  # qd-llm-length-recovery:v1
+    CodeEditLengthError,
+    apply_recovered_code_edit,
+    call_code_edit_with_length_recovery,
+)
 from app.services.strategy_ai_generation import (
     apply_deterministic_strategy_edit,
     build_strategy_generation_request,
@@ -793,18 +798,27 @@ def run_strategy_workspace_turn():
             summary=(workspace or {}).get("summary") or {},
             recent_messages=(workspace or {}).get("recent_messages") or [],
         )
+        length_recovery = "none"
         if deterministic_edit:
             candidate_code, edit_plan = deterministic_edit
         else:
-            generated = llm.call_llm_api(
-                messages=messages,
-                model=llm.get_code_generation_model(),
-                temperature=0.2 if use_patch_response else 0.35,
-                use_json_mode=use_patch_response,
-            )
             if use_patch_response:
+                generated, length_recovery = call_code_edit_with_length_recovery(
+                    llm.call_llm_api,
+                    messages=messages,
+                    model=llm.get_code_generation_model(),
+                    temperature=0.2,
+                    use_json_mode=True,
+                    lang=lang,
+                )
                 try:
-                    candidate_code, edit_plan = apply_model_code_edits(existing_code, generated)
+                    candidate_code, edit_plan = apply_recovered_code_edit(
+                        existing_code,
+                        generated,
+                        length_recovery,
+                        apply_model_code_edits,
+                        lang=lang,
+                    )
                 except CodeEditError as exc:
                     logger.warning("strategy model patch rejected, retrying full candidate: %s", exc)
                     full_request = build_strategy_generation_request(
@@ -830,7 +844,16 @@ def run_strategy_workspace_turn():
                         "operation": "generate_candidate",
                         "patch_error": str(exc),
                     }
+                else:
+                    if length_recovery == "complete_patch":
+                        edit_plan = {**edit_plan, "length_recovery": "complete_patch"}
             else:
+                generated = llm.call_llm_api(
+                    messages=messages,
+                    model=llm.get_code_generation_model(),
+                    temperature=0.35,
+                    use_json_mode=False,
+                )
                 candidate_code = _strip_code_fence(str(generated or ""))
                 edit_plan = {"executor": "model", "operation": "generate_candidate"}
         candidate_before_validation = candidate_code
@@ -839,16 +862,27 @@ def run_strategy_workspace_turn():
             existing_code=existing_code,
             context=context,
         )
-        candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
-            llm,
-            user_prompt,
-            candidate_code,
-            asset_type=asset_type,
-            generation_mode=generation_mode,
-            context=context,
-            system_prompt=full_system_prompt,
-            intent=validation_intent,
-        )
+        validation_failed = False
+        try:
+            candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
+                llm,
+                user_prompt,
+                candidate_code,
+                asset_type=asset_type,
+                generation_mode=generation_mode,
+                context=context,
+                system_prompt=full_system_prompt,
+                intent=validation_intent,
+                max_repair_attempts=0 if length_recovery == "complete_patch" else 2,
+            )
+        except CodeEditLengthError:
+            raise
+        except Exception:
+            validation_failed = length_recovery == "complete_patch"
+            if not validation_failed:
+                raise
+        if validation_failed:
+            raise CodeEditLengthError("invalid_patch", lang)
         if candidate_code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
             edit_plan = {
                 "executor": "model_patch_repaired",
@@ -896,6 +930,11 @@ def run_strategy_workspace_turn():
         return _error(str(exc), 404)
     except PermissionError as exc:
         return _error(str(exc), 403)
+    except CodeEditLengthError as exc:
+        return _error(
+            "strategyV2.generationInvalid",
+            data={"error": str(exc), "lengthRecovery": exc.kind, "codeApplied": False},
+        )
     except ValueError as exc:
         return _error("strategyV2.generationInvalid", data={"error": str(exc)})
     except Exception as exc:
