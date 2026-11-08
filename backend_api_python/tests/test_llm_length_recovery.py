@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import stat
 import subprocess
@@ -206,6 +207,164 @@ def test_recovered_invalid_patch_is_not_applied_and_does_not_fall_through():
     assert "没有应用任何代码" in str(caught.value)
 
 
+def _assert_safe_error(error: recovery.CodeEditLengthError, *secrets: str) -> None:
+    rendered = f"{error} {error!r} {error.__cause__} {error.__context__}"
+    for secret in secrets:
+        assert secret not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_exception_text_is_not_a_length_signal_and_errors_drop_secrets(capsys):
+    recorded = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            recorded.append(record.getMessage())
+
+    handler = _Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    noisy = ValueError(f"finish_reason length max_tokens_exceeded {TRUNCATED} {SECRET} {CHAT}")
+    call, calls = _record_call([noisy])
+    with pytest.raises(ValueError) as caught:
+        recovery.call_code_edit_with_length_recovery(
+            call,
+            messages=_messages(),
+            model="m",
+            temperature=0.2,
+            use_json_mode=True,
+        )
+    assert caught.value is noisy
+    assert len(calls) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert SECRET not in captured.err
+    assert TRUNCATED not in captured.err
+    assert CHAT not in captured.err
+
+    class Mixed(Exception):
+        error_type = "timeout"
+        finish_reason = "length"
+
+        def __str__(self) -> str:
+            return f"{TRUNCATED} {SECRET}"
+
+        def __repr__(self) -> str:
+            return self.__str__()
+
+    call, calls = _record_call([Mixed()])
+    with pytest.raises(Mixed):
+        recovery.call_code_edit_with_length_recovery(call, messages=_messages(), model="m", temperature=0.2, use_json_mode=True)
+    assert len(calls) == 1
+
+    structured = LengthStop()
+    valid = json.dumps({"coverage": "complete", "operations": [{"old_text": "alpha = 1\n", "new_text": "alpha = 2\n"}]})
+    call, calls = _record_call([structured, valid])
+    content, status = recovery.call_code_edit_with_length_recovery(
+        call,
+        messages=_messages(),
+        model="deepseek-v4.1-flash",
+        temperature=0.2,
+        use_json_mode=True,
+    )
+    assert status == "complete_patch"
+    assert content is valid
+    assert len(calls) == 2
+    assert TRUNCATED not in calls[1]["messages"][-1]["content"]
+    root.removeHandler(handler)
+    logged = "\n".join(recorded)
+    assert SECRET not in logged
+    assert TRUNCATED not in logged
+    assert CHAT not in logged
+
+
+def test_self_reported_partial_patch_is_not_applied_even_when_operations_validate():
+    partial = json.dumps({
+        "coverage": "partial",
+        "operations": [{"old_text": "alpha = 1\n", "new_text": "alpha = 2\n"}],
+    })
+    applied = []
+
+    def apply(source, content):
+        applied.append((source, content))
+        return "alpha = 2\n", {"executor": "model_patch"}
+
+    call, calls = _record_call([LengthStop(), partial])
+    with pytest.raises(recovery.CodeEditLengthError) as caught:
+        recovery.call_code_edit_with_length_recovery(call, messages=_messages(), model="m", temperature=0.2, use_json_mode=True)
+    _assert_safe_error(caught.value, TRUNCATED, SECRET, STRATEGY, CHAT, partial)
+    assert caught.value.kind == "incomplete"
+    assert applied == []
+    assert len(calls) == 2
+    with pytest.raises(recovery.CodeEditLengthError):
+        recovery.apply_recovered_code_edit("alpha = 1\n", partial, "complete_patch", apply)
+    assert applied == []
+
+
+def test_second_non_length_error_stops_without_fallback_or_secret_text():
+    fallback = []
+
+    def apply(source, content):
+        fallback.append(content)
+        raise edits.CodeEditError(f"invalid {SECRET} {content}")
+
+    call, calls = _record_call([LengthStop(), ProviderHTTPError()])
+    with pytest.raises(recovery.CodeEditLengthError) as caught:
+        content, status = recovery.call_code_edit_with_length_recovery(
+            call,
+            messages=_messages(),
+            model="m",
+            temperature=0.2,
+            use_json_mode=True,
+        )
+        try:
+            recovery.apply_recovered_code_edit("alpha = 1\n", content, status, apply)
+        except edits.CodeEditError:
+            fallback.append("FULL")
+    _assert_safe_error(caught.value, TRUNCATED, SECRET, STRATEGY, CHAT, "HTTP")
+    assert caught.value.kind == "retry_failed"
+    assert len(calls) == 2
+    assert fallback == []
+
+
+def test_route_shaped_failures_never_use_full_source_fallback():
+    source = "alpha = 1\n"
+    cases = [
+        [LengthStop(), LengthStop()],
+        [LengthStop(), '{"operations":[{"old_text":"alpha'],
+        [LengthStop(), json.dumps({"coverage": "narrowed", "operations": [{"old_text": source, "new_text": "alpha = 9\n"}]})],
+        [LengthStop(), ProviderTimeout()],
+    ]
+    for responses in cases:
+        calls_box = []
+
+        def call(**kwargs):
+            calls_box.append(kwargs)
+            item = responses[len(calls_box) - 1]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        full_fallback = []
+        with pytest.raises(recovery.CodeEditLengthError) as caught:
+            generated, status = recovery.call_code_edit_with_length_recovery(
+                call,
+                messages=_messages(),
+                model="m",
+                temperature=0.2,
+                use_json_mode=True,
+            )
+            try:
+                recovery.apply_recovered_code_edit(source, generated, status, edits.apply_model_code_edits)
+            except edits.CodeEditError:
+                full_fallback.append("FULL")
+        _assert_safe_error(caught.value, TRUNCATED, SECRET, STRATEGY, CHAT)
+        assert full_fallback == []
+        assert len(calls_box) == 2
+        assert "codeApplied" not in str(caught.value)
+
+
 def test_non_length_failures_do_not_retry_and_invalid_json_stays_a_code_edit_error():
     messages = _messages()
     for failure in (ProviderTimeout(), ProviderHTTPError(), ValueError(f"length {SECRET}")):
@@ -234,19 +393,21 @@ def test_non_length_failures_do_not_retry_and_invalid_json_stays_a_code_edit_err
     assert len(calls) == 1
 
 
-def test_time_budget_reports_existing_limits_without_changing_them():
+def test_time_budget_does_not_treat_gunicorn_silence_as_a_hard_kill():
     observed = recovery.length_recovery_time_budget(62)
     assert observed["timeouts_unchanged"] is True
-    assert observed["provider_timeout_seconds"] == 120
-    assert observed["gateway_timeout_seconds"] == 120
-    assert observed["client_timeout_seconds"] == 180
-    assert observed["fits_gateway_worst_case"] is False
-    assert observed["fits_client_worst_case"] is False
-    assert observed["fits_gateway_if_retry_matches_first"] is False
-    assert observed["fits_client_if_retry_matches_first"] is True
-    quick = recovery.length_recovery_time_budget(3)
-    assert quick["fits_gateway_if_retry_matches_first"] is True
-    assert quick["fits_client_if_retry_matches_first"] is True
+    assert observed["provider_call_timeout_seconds"] == 120
+    assert observed["gunicorn_silence_timeout_seconds"] == 120
+    assert observed["gunicorn_worker_class"] == "gthread"
+    assert observed["gunicorn_preload_app"] is False
+    assert observed["gunicorn_timeout_is_per_request_hard_kill"] is False
+    assert observed["client_wait_seconds"] == 180
+    assert observed["proxy_read_timeout_known"] is False
+    assert "fits_gateway_worst_case" not in observed
+    config = (BACKEND_ROOT / "gunicorn_config.py").read_text(encoding="utf-8")
+    assert 'worker_class = "gthread"' in config
+    assert "preload_app = False" in config
+    assert "timeout = 120" in config
 
 
 def test_public_files_do_not_embed_runtime_paths_or_attack_tools():
@@ -421,3 +582,59 @@ def test_unknown_strategy_and_lock_conflict_do_not_write(tmp_path, capsys):
     assert "holds the lock" in captured.err
     assert not helper.exists()
     assert hashlib.sha256(target.read_bytes()).hexdigest() == patcher.STRATEGY_SHA256
+
+
+def test_strategy_delivery_does_not_contain_the_llm_override():
+    text = STRATEGY_PATH.read_text(encoding="utf-8")
+    script = SCRIPT_PATH.read_text(encoding="utf-8")
+    for banned in (
+        "def _llm_post",
+        "def _custom_capacity_key",
+        "def _custom_inline_system_payload",
+        "qd-llm-call-diagnostics",
+        "upstream_capacity",
+    ):
+        assert banned not in text
+        assert banned not in script
+    assert hashlib.sha256(text.encode("utf-8")).hexdigest() != patcher.LLM_OVERRIDE_SHA256
+    assert len(text.encode("utf-8")) != 73082
+
+
+def test_concurrent_strategy_change_is_not_overwritten_and_helper_is_removed(tmp_path, capsys):
+    baseline = _baseline_text().encode("utf-8")
+    target = tmp_path / "strategy.py"
+    target.write_bytes(baseline)
+    helper = tmp_path / "llm_length_recovery.py"
+    state = tmp_path / "state"
+    secret = b"PARTIAL_SENTINEL_sk-live-SECRETKEY"
+    real_install = patcher._install_helper
+
+    def install_and_change(*args, **kwargs):
+        created = real_install(*args, **kwargs)
+        fd = os.open(target, os.O_WRONLY)
+        try:
+            os.write(fd, secret)
+            os.ftruncate(fd, len(secret))
+        finally:
+            os.close(fd)
+        return created
+
+    patcher._install_helper = install_and_change
+    try:
+        code = patcher.main([
+            "apply",
+            "--strategy-target", str(target),
+            "--helper-target", str(helper),
+            "--state-dir", str(state),
+            "--worker-uid", str(os.geteuid()),
+            "--worker-gid", str(os.getegid()),
+        ])
+    finally:
+        patcher._install_helper = real_install
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "changed" in captured.err
+    assert b"PARTIAL_SENTINEL" not in captured.err.encode("utf-8")
+    assert b"sk-live" not in captured.err.encode("utf-8")
+    assert target.read_bytes() == secret
+    assert not helper.exists()

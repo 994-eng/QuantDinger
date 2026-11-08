@@ -4,6 +4,10 @@ This module is used only by the strategy workspace modify path. It does not
 change provider timeouts, model, temperature, or max token settings, and it
 never writes prompt or completion text.
 
+The configured Gunicorn timeout is a worker-silence interval. With
+``worker_class = gthread`` and ``preload_app = False``, that number is not a
+proven hard limit for one request. The proxy read timeout is not known here.
+
 A normal provider result is returned unchanged. A length failure may be
 retried once, asking for a new complete JSON patch of the same change. The
 retry is not a continuation of the discarded fragment. A second length
@@ -16,12 +20,14 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-PROVIDER_TIMEOUT_SECONDS = 120
-GATEWAY_TIMEOUT_SECONDS = 120
-CLIENT_TIMEOUT_SECONDS = 180
+PROVIDER_CALL_TIMEOUT_SECONDS = 120
+GUNICORN_SILENCE_TIMEOUT_SECONDS = 120
+CLIENT_WAIT_SECONDS = 180
 
 _INCOMPLETE_COVERAGE = {"incomplete", "partial", "narrowed"}
-_KINDS = {"exhausted", "incomplete", "invalid_patch"}
+_LENGTH_ERROR_TYPE = "max_tokens_exceeded"
+_LENGTH_FINISH_REASON = "length"
+_KINDS = {"exhausted", "incomplete", "invalid_patch", "retry_failed"}
 _RECOVERY_INSTRUCTION = (
     "The previous answer was discarded because it reached the output limit "
     "before it was a complete JSON patch. Return one new complete, "
@@ -44,6 +50,10 @@ _MESSAGES = {
         "zh": "重新生成的补丁无法通过完整性校验，没有应用任何代码。请缩小这次修改的范围后再试。",
         "en": "The regenerated patch failed validation, so no code was applied. Narrow this change and try again.",
     },
+    "retry_failed": {
+        "zh": "重新请求完整补丁时失败，没有应用任何代码。请缩小这次修改的范围后再试。",
+        "en": "The request for a complete patch failed, so no code was applied. Narrow this change and try again.",
+    },
 }
 
 
@@ -57,17 +67,17 @@ class CodeEditLengthError(ValueError):
 
 
 def is_output_length_error(exc: BaseException) -> bool:
-    """True only for a token-limit stop, not for timeouts or HTTP failures."""
-    error_type = getattr(exc, "error_type", "")
-    finish_reason = getattr(exc, "finish_reason", "")
-    if not isinstance(error_type, str):
-        error_type = ""
-    if not isinstance(finish_reason, str):
-        finish_reason = ""
-    return (
-        error_type.strip().lower() == "max_tokens_exceeded"
-        or finish_reason.strip().lower() == "length"
-    )
+    """True only for structured provider fields, never for exception text.
+
+    The running provider error exposes ``error_type`` and ``finish_reason``.
+    A length stop sets ``max_tokens_exceeded`` and ``finish_reason`` ``length``.
+    Message text is ignored, including text that merely contains those words.
+    """
+    error_type = _structured_token(getattr(exc, "error_type", None))
+    finish_reason = _structured_token(getattr(exc, "finish_reason", None))
+    if error_type == _LENGTH_ERROR_TYPE and finish_reason in {"", _LENGTH_FINISH_REASON}:
+        return True
+    return finish_reason == _LENGTH_FINISH_REASON and error_type in {"", _LENGTH_ERROR_TYPE}
 
 
 def call_code_edit_with_length_recovery(call: Callable[..., Any], /, **kwargs: Any) -> tuple[Any, str]:
@@ -84,17 +94,19 @@ def call_code_edit_with_length_recovery(call: Callable[..., Any], /, **kwargs: A
     except Exception as exc:
         if not is_output_length_error(exc):
             raise
-        retry_kwargs = dict(call_kwargs)
-        retry_kwargs["messages"] = _recovery_messages(call_kwargs.get("messages"))
-        try:
-            recovered = call(**retry_kwargs)
-        except Exception as retry_exc:
-            if is_output_length_error(retry_exc):
-                raise CodeEditLengthError("exhausted", lang) from None
-            raise
-        if _coverage(recovered) in _INCOMPLETE_COVERAGE:
-            raise CodeEditLengthError("incomplete", lang) from None
-        return recovered, "complete_patch"
+    retry_kwargs = dict(call_kwargs)
+    retry_kwargs["messages"] = _recovery_messages(call_kwargs.get("messages"))
+    recovered = None
+    failure = ""
+    try:
+        recovered = call(**retry_kwargs)
+    except Exception as retry_exc:
+        failure = "exhausted" if is_output_length_error(retry_exc) else "retry_failed"
+    if failure:
+        raise CodeEditLengthError(failure, lang)
+    if _coverage(recovered) in _INCOMPLETE_COVERAGE:
+        raise CodeEditLengthError("incomplete", lang)
+    return recovered, "complete_patch"
 
 
 def apply_recovered_code_edit(
@@ -104,34 +116,48 @@ def apply_recovered_code_edit(
     apply: Callable[[str, Any], tuple[str, dict[str, Any]]],
     lang: str = "zh-CN",
 ) -> tuple[str, dict[str, Any]]:
-    """Validate a patch. A failed recovery patch does not fall through."""
+    """Validate a patch. A failed or self-reported partial recovery does not fall through."""
+    if length_recovery == "complete_patch" and _coverage(content) in _INCOMPLETE_COVERAGE:
+        raise CodeEditLengthError("incomplete", lang)
+    rejected = False
     try:
         return apply(source, content)
     except Exception as exc:
-        if length_recovery == "complete_patch" and type(exc).__name__ == "CodeEditError":
-            raise CodeEditLengthError("invalid_patch", lang) from None
-        raise
+        rejected = length_recovery == "complete_patch" and type(exc).__name__ == "CodeEditError"
+        if not rejected:
+            raise
+    raise CodeEditLengthError("invalid_patch", lang)
 
 
 def length_recovery_time_budget(first_elapsed_seconds: float) -> dict[str, Any]:
-    """Describe existing limits. This does not change any timeout."""
+    """Report configured timers without inferring that a total duration kills the worker.
+
+    Each provider call still uses the existing 120s request timeout. Gunicorn's
+    120s timeout, with the gthread worker and preload disabled, measures worker
+    silence. It is not treated here as a hard abort at 124s. The frontend wait
+    and the proxy read timeout are separate, and the proxy value is not known.
+    """
     elapsed = first_elapsed_seconds if isinstance(first_elapsed_seconds, (int, float)) else 0
     if isinstance(elapsed, float) and elapsed != elapsed:
         elapsed = 0
     elapsed = max(0.0, float(elapsed))
-    worst_case = elapsed + PROVIDER_TIMEOUT_SECONDS
     return {
-        "provider_timeout_seconds": PROVIDER_TIMEOUT_SECONDS,
-        "gateway_timeout_seconds": GATEWAY_TIMEOUT_SECONDS,
-        "client_timeout_seconds": CLIENT_TIMEOUT_SECONDS,
         "timeouts_unchanged": True,
+        "provider_call_timeout_seconds": PROVIDER_CALL_TIMEOUT_SECONDS,
+        "gunicorn_silence_timeout_seconds": GUNICORN_SILENCE_TIMEOUT_SECONDS,
+        "gunicorn_worker_class": "gthread",
+        "gunicorn_preload_app": False,
+        "gunicorn_timeout_is_per_request_hard_kill": False,
+        "client_wait_seconds": CLIENT_WAIT_SECONDS,
+        "proxy_read_timeout_known": False,
         "first_elapsed_seconds": elapsed,
-        "worst_case_total_seconds": worst_case,
-        "fits_gateway_worst_case": worst_case <= GATEWAY_TIMEOUT_SECONDS,
-        "fits_client_worst_case": worst_case <= CLIENT_TIMEOUT_SECONDS,
-        "fits_gateway_if_retry_matches_first": elapsed * 2 <= GATEWAY_TIMEOUT_SECONDS,
-        "fits_client_if_retry_matches_first": elapsed * 2 <= CLIENT_TIMEOUT_SECONDS,
     }
+
+
+def _structured_token(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
 
 
 def _recovery_messages(messages: Any) -> list[dict[str, str]]:

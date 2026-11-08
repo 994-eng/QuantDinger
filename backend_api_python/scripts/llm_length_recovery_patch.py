@@ -55,7 +55,7 @@ NEW_DET = '        length_recovery = "none"\n        if deterministic_edit:\n   
 
 OLD_COMP = '        candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(\n            llm,\n            user_prompt,\n            candidate_code,\n            asset_type=asset_type,\n            generation_mode=generation_mode,\n            context=context,\n            system_prompt=full_system_prompt,\n            intent=validation_intent,\n        )\n'
 
-NEW_COMP = '        try:\n            candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(\n                llm,\n                user_prompt,\n                candidate_code,\n                asset_type=asset_type,\n                generation_mode=generation_mode,\n                context=context,\n                system_prompt=full_system_prompt,\n                intent=validation_intent,\n                max_repair_attempts=0 if length_recovery == "complete_patch" else 2,\n            )\n        except CodeEditLengthError:\n            raise\n        except Exception:\n            if length_recovery != "complete_patch":\n                raise\n            raise CodeEditLengthError("invalid_patch", lang) from None\n'
+NEW_COMP = '        validation_failed = False\n        try:\n            candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(\n                llm,\n                user_prompt,\n                candidate_code,\n                asset_type=asset_type,\n                generation_mode=generation_mode,\n                context=context,\n                system_prompt=full_system_prompt,\n                intent=validation_intent,\n                max_repair_attempts=0 if length_recovery == "complete_patch" else 2,\n            )\n        except CodeEditLengthError:\n            raise\n        except Exception:\n            validation_failed = length_recovery == "complete_patch"\n            if not validation_failed:\n                raise\n        if validation_failed:\n            raise CodeEditLengthError("invalid_patch", lang)\n'
 
 REPLACEMENTS = (
     ("import_site", OLD_IMPORT, NEW_IMPORT),
@@ -68,6 +68,10 @@ REPLACEMENTS = (
 
 class PatchRejected(Exception):
     """The target is not the supported strategy revision or the patch is unsafe."""
+
+
+class _FileChanged(PatchRejected):
+    """The strategy bytes changed after the baseline check and must not be replaced."""
 
 
 def helper_source_path() -> Path:
@@ -176,9 +180,14 @@ def _apply(args: argparse.Namespace) -> None:
         created_helper = _install_helper(args.helper_target, helper_bytes, args.worker_uid, args.worker_gid)
         state = _state_dir(args.strategy_target, args.state_dir)
         try:
+            _require_unchanged(fd, original, identity)
             _prepare_state(state)
             _write_backup(state, original, identity, _sha256(patched_bytes), _sha256(helper_bytes), created_helper, args.worker_uid, args.worker_gid)
+            _require_unchanged(fd, original, identity)
             _write_fd(fd, patched_bytes)
+        except _FileChanged:
+            _remove_helper_if_created(args.helper_target, helper_bytes, created_helper)
+            raise
         except Exception as exc:
             _remove_helper_if_created(args.helper_target, helper_bytes, created_helper)
             try:
@@ -218,6 +227,7 @@ def _rollback(args: argparse.Namespace) -> None:
         compile(restored, "<llm-length-recovery-rollback>", "exec")
         if MARKER in restored:
             raise PatchRejected("backup still contains the patch marker")
+        _require_unchanged(fd, current, identity)
         _write_fd(fd, backup)
         os.fchmod(fd, int(manifest.get("mode", identity["mode"])))
         _, confirmed = _read_fd(fd)
@@ -371,6 +381,16 @@ def _refuse_protected(digest: str, target: Path) -> None:
         raise PatchRejected("refusing to patch the bind-mounted llm.py revision")
     if digest == DIAGNOSTIC_HELPER_SHA256 or target.name == "llm_call_diagnostics.py":
         raise PatchRejected("refusing to patch the diagnostic helper")
+
+
+def _require_unchanged(fd: int, expected: bytes, identity: dict[str, int | str]) -> None:
+    latest, latest_identity = _read_fd(fd)
+    if (
+        latest != expected
+        or latest_identity["inode"] != identity["inode"]
+        or latest_identity["sha256"] != identity["sha256"]
+    ):
+        raise _FileChanged("strategy file changed while the patch was being prepared")
 
 
 def _is_baseline(identity: dict[str, int | str]) -> bool:

@@ -862,6 +862,7 @@ def run_strategy_workspace_turn():
             existing_code=existing_code,
             context=context,
         )
+        validation_failed = False
         try:
             candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
                 llm,
@@ -877,9 +878,11 @@ def run_strategy_workspace_turn():
         except CodeEditLengthError:
             raise
         except Exception:
-            if length_recovery != "complete_patch":
+            validation_failed = length_recovery == "complete_patch"
+            if not validation_failed:
                 raise
-            raise CodeEditLengthError("invalid_patch", lang) from None
+        if validation_failed:
+            raise CodeEditLengthError("invalid_patch", lang)
         if candidate_code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
             edit_plan = {
                 "executor": "model_patch_repaired",
